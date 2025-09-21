@@ -1,0 +1,210 @@
+import requests
+import pandas as pd
+import json
+from collections import Counter
+import time
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import LabelEncoder
+import joblib
+from flask import Flask, render_template, request
+import sys
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Part 1: Collect suspicious IPs from AbuseIPDB
+ABUSEIPDB_API_KEY = '0daf7bc34ecbbda20730d2336d8cbe693cced513e1a032051f3859bb915021777a1c304fd926fc12'
+BASE_URL = 'https://api.abuseipdb.com/api/v2'
+
+headers = {
+    'Key': ABUSEIPDB_API_KEY,
+    'Accept': 'application/json'
+}
+
+# Fetch blacklist with valid confidenceMinimum
+blacklist_params = {
+    'confidenceMinimum': 25,  # Changed to 25 (valid for free tier)
+    'limit': 100
+}
+
+response = requests.get(f'{BASE_URL}/blacklist', headers=headers, params=blacklist_params)
+dataset = []
+common_categories = Counter()
+
+if response.status_code != 200:
+    print(f"Error fetching blacklist: {response.text}")
+    sys.exit("AbuseIPDB API call failed. Please check your API key or network connection.")
+else:
+    data = response.json()
+    malicious_ips = [item['ipAddress'] for item in data['data']]
+    print(f"Fetched {len(malicious_ips)} malicious IPs from AbuseIPDB")
+
+    if not malicious_ips:
+        print("No IPs fetched from AbuseIPDB. Exiting.")
+        sys.exit()
+
+    for ip in malicious_ips[:50]:
+        check_params = {
+            'ipAddress': ip,
+            'verbose': '',
+            'maxAgeInDays': 30
+        }
+        response = requests.get(f'{BASE_URL}/check', headers=headers, params=check_params)
+        if response.status_code == 200:
+            check_data = response.json()
+            confidence = check_data['data']['abuseConfidenceScore']
+            reports = check_data['data'].get('reports', [])
+            categories = []
+            for report in reports:
+                cat_list = report.get('categories', [])
+                categories.extend(cat_list)
+                common_categories.update(cat_list)
+            unique_cats = list(set(categories))
+
+            # Geo-location from ip-api.com
+            geo_response = requests.get(f'http://ip-api.com/json/{ip}')
+            geo_data = geo_response.json() if geo_response.status_code == 200 else {}
+            country = geo_data.get('country', 'Unknown')
+            city = geo_data.get('city', 'Unknown')
+            isp = geo_data.get('isp', 'Unknown')
+
+            dataset.append({
+                'ip': ip,
+                'confidence': confidence,
+                'categories': json.dumps(unique_cats),
+                'country': country,
+                'city': city,
+                'isp': isp,
+                'label': 1
+            })
+            time.sleep(1)
+        else:
+            print(f"Error checking {ip}: {response.text}")
+
+print("Most common attack categories from AbuseIPDB:")
+for cat, count in common_categories.most_common(10):
+    print(f"Category {cat}: {count} times")
+
+mal_df = pd.DataFrame(dataset)
+if mal_df.empty:
+    print("No malicious IPs collected. Exiting.")
+    sys.exit()
+
+mal_df.to_csv('malicious_ips_abuseipdb.csv', index=False)
+print("Malicious dataset saved to malicious_ips_abuseipdb.csv")
+
+# Generate benign IPs
+import random
+benign_ips = []
+for _ in range(len(mal_df)):
+    ip1 = random.randint(1, 223)
+    ip2, ip3, ip4 = random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
+    benign_ip = f"{ip1}.{ip2}.{ip3}.{ip4}"
+    geo_response = requests.get(f'http://ip-api.com/json/{benign_ip}')
+    geo_data = geo_response.json() if geo_response.status_code == 200 else {}
+    country = geo_data.get('country', 'Unknown')
+    city = geo_data.get('city', 'Unknown')
+    isp = geo_data.get('isp', 'Unknown')
+    benign_ips.append({
+        'ip': benign_ip,
+        'confidence': 0,
+        'categories': json.dumps([]),
+        'country': country,
+        'city': city,
+        'isp': isp,
+        'label': 0
+    })
+    time.sleep(1)
+
+ben_df = pd.DataFrame(benign_ips)
+full_df = pd.concat([mal_df, ben_df], ignore_index=True)
+full_df.to_csv('full_dataset_with_geo.csv', index=False)
+print("Full dataset saved to full_dataset_with_geo.csv")
+
+# Part 2: Train AI model
+try:
+    df = pd.read_csv('full_dataset_with_geo.csv')
+except pd.errors.EmptyDataError:
+    print("Error: full_dataset_with_geo.csv is empty or malformed. Exiting.")
+    sys.exit()
+
+def ip_to_features(ip):
+    parts = ip.split('.')
+    if len(parts) == 4:
+        try:
+            return [int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])]
+        except ValueError:
+            return [0, 0, 0, 0]
+    return [0, 0, 0, 0]
+
+label_encoders = {}
+for col in ['country', 'city', 'isp']:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col].fillna('Unknown'))
+    label_encoders[col] = le
+
+df['ip_features'] = df['ip'].apply(ip_to_features)
+X = np.hstack([np.array(df['ip_features'].tolist()), df[['confidence', 'country', 'city', 'isp']].values])
+y = df['label'].values
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+print(f"Model Accuracy: {accuracy_score(y_test, y_pred):.2f}")
+
+joblib.dump(model, 'ip_classifier_model_with_geo.pkl')
+joblib.dump(label_encoders, 'label_encoders.pkl')
+print("Model and encoders saved")
+
+# Part 3: Flask routes for web interface
+def check_ip(ip, model, label_encoders):
+    geo_response = requests.get(f'http://ip-api.com/json/{ip}')
+    geo_data = geo_response.json() if geo_response.status_code == 200 else {}
+    country = geo_data.get('country', 'Unknown')
+    city = geo_data.get('city', 'Unknown')
+    isp = geo_data.get('isp', 'Unknown')
+
+    ip_features = ip_to_features(ip)
+    encoded_features = []
+    for col in ['country', 'city', 'isp']:
+        le = label_encoders[col]
+        try:
+            encoded = le.transform([geo_data.get(col, 'Unknown')])[0]
+        except ValueError:
+            encoded = le.transform(['Unknown'])[0]
+        encoded_features.append(encoded)
+
+    features = np.array(ip_features + [50] + encoded_features).reshape(1, -1)
+    prob = model.predict_proba(features)[0][1]
+    is_suspicious = prob > 0.5
+    return is_suspicious, prob, country, city, isp
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    result = None
+    if request.method == 'POST':
+        input_ip = request.form.get('ip')
+        if input_ip:
+            try:
+                model = joblib.load('ip_classifier_model_with_geo.pkl')
+                label_encoders = joblib.load('label_encoders.pkl')
+                suspicious, prob, country, city, isp = check_ip(input_ip, model, label_encoders)
+                result = {
+                    'ip': input_ip,
+                    'suspicious': suspicious,
+                    'probability': round(prob, 2),
+                    'country': country,
+                    'city': city,
+                    'isp': isp
+                }
+            except Exception as e:
+                result = {'error': f"Invalid IP or error: {str(e)}"}
+    return render_template('index.html', result=result)
+
+if __name__ == '__main__':
+    app.run(debug=True)
